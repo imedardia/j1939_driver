@@ -1,3 +1,13 @@
+/*
+ * J1939 Simple Transport Protocol Driver
+ * All PGN Filtering and SPN-Data processing
+ * should be handled in User-space
+ * For the moment DM1/DM2/DM13 Multipacket frames
+ * processing is done also at user-space Level
+ * 
+ * This module is highly inspired for CAN-RAW
+ * Linux Module source code
+ */ 
 #include <linux/module.h>
 #include <linux/init.h>
 #include <linux/uio.h>
@@ -15,53 +25,49 @@
 #include <net/net_namespace.h>
 
 #define CAN_J1939_VERSION "20171203"
+/*
+ * Let's use for the moment the PROTO-5 (CAN_MCNET) as
+ * it will avoid for us to recompile all Linux Kernel
+ * built-in module like Core, BCM, GW, ISOTP ...
+ */ 
 #define CAN_J1939 5
 
+#define SOL_CAN_J1939 (SOL_CAN_BASE + CAN_J1939)
+
+/*
+ * Define IOCTLs for J1939 Protocol Module
+ */
+ 
+ enum {
+	CAN_J1939_FILTER = 1,	/* set 0 .. n can_filter(s)          */
+    CAN_J1939_MAX_IOCTLS
+};
+ 
+ /*
+  * 512 is the Max number of CAN Filters supported
+  * within J1939 Proto
+  */
+ #define CAN_J1939_FILTER_MAX 512
+
 MODULE_DESCRIPTION("PF_CAN J1939 protocol");
-MODULE_LICENSE("Dual BSD/GPL");
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR("imed benromdhane <benromdhane.imed@gmail.com>");
 MODULE_ALIAS("can-proto-5");
 
-#define MASK_ALL 0
 
-/*
- * A raw socket has a list of can_filters attached to it, each receiving
- * the CAN frames matching that filter.  If the filter list is empty,
- * no CAN frames will be received by the socket.  The default after
- * opening the socket, is to have one filter which receives all frames.
- * The filter list is allocated dynamically with the exception of the
- * list containing only one item.  This common case is optimized by
- * storing the single filter in dfilter, to avoid using dynamic memory.
- */
 
-struct uniqframe {
-	int skbcnt;
-	const struct sk_buff *skb;
-	unsigned int join_rx_count;
-};
 
-struct raw_sock {
+struct j1939_sock {
 	struct sock sk;
 	int bound;
 	int ifindex;
 	struct notifier_block notifier;
-	int loopback;
-	int recv_own_msgs;
-	int fd_frames;
-	int join_filters;
 	int count;                 /* number of active filters */
 	struct can_filter dfilter; /* default/single filter */
 	struct can_filter *filter; /* pointer to filter(s) */
-	can_err_mask_t err_mask;
-	struct uniqframe __percpu *uniq;
 };
 
-/*
- * Return pointer to store the extra msg flags for raw_recvmsg().
- * We use the space of one unsigned int beyond the 'struct sockaddr_can'
- * in skb->cb.
- */
-static inline unsigned int *raw_flags(struct sk_buff *skb)
+static inline unsigned int *j1939_flags(struct sk_buff *skb)
 {
 	sock_skb_cb_check_size(sizeof(struct sockaddr_can) +
 			       sizeof(unsigned int));
@@ -70,78 +76,44 @@ static inline unsigned int *raw_flags(struct sk_buff *skb)
 	return (unsigned int *)(&((struct sockaddr_can *)skb->cb)[1]);
 }
 
-static inline struct raw_sock *raw_sk(const struct sock *sk)
+static inline struct j1939_sock *j1939_sk(const struct sock *sk)
 {
-	return (struct raw_sock *)sk;
+	return (struct j1939_sock *)sk;
 }
 
-static void raw_rcv(struct sk_buff *oskb, void *data)
+static void j1939_rcv(struct sk_buff *oskb, void * data)
 {
 	struct sock *sk = (struct sock *)data;
-	struct raw_sock *ro = raw_sk(sk);
 	struct sockaddr_can *addr;
-	struct sk_buff *skb;
-	unsigned int *pflags;
-
-	/* check the received tx sock reference */
-	if (!ro->recv_own_msgs && oskb->sk == sk)
-		return;
-
-	/* do not pass non-CAN2.0 frames to a legacy socket */
-	if (!ro->fd_frames && oskb->len != CAN_MTU)
-		return;
-
-	/* eliminate multiple filter matches for the same skb */
-	if (this_cpu_ptr(ro->uniq)->skb == oskb &&
-	    this_cpu_ptr(ro->uniq)->skbcnt == can_skb_prv(oskb)->skbcnt) {
-		if (ro->join_filters) {
-			this_cpu_inc(ro->uniq->join_rx_count);
-			/* drop frame until all enabled filters matched */
-			if (this_cpu_ptr(ro->uniq)->join_rx_count < ro->count)
-				return;
-		} else {
-			return;
-		}
-	} else {
-		this_cpu_ptr(ro->uniq)->skb = oskb;
-		this_cpu_ptr(ro->uniq)->skbcnt = can_skb_prv(oskb)->skbcnt;
-		this_cpu_ptr(ro->uniq)->join_rx_count = 1;
-		/* drop first frame to check all enabled filters? */
-		if (ro->join_filters && ro->count > 1)
-			return;
-	}
-
+	unsigned int * j1939flags;
+	struct sk_buff *skb; 
 	/* clone the given skb to be able to enqueue it into the rcv queue */
 	skb = skb_clone(oskb, GFP_ATOMIC);
 	if (!skb)
 		return;
-
-	/*
-	 *  Put the datagram to the queue so that raw_recvmsg() can
-	 *  get it from there.  We need to pass the interface index to
-	 *  raw_recvmsg().  We pass a whole struct sockaddr_can in skb->cb
-	 *  containing the interface index.
-	 */
 
 	sock_skb_cb_check_size(sizeof(struct sockaddr_can));
 	addr = (struct sockaddr_can *)skb->cb;
 	memset(addr, 0, sizeof(*addr));
 	addr->can_family  = AF_CAN;
 	addr->can_ifindex = skb->dev->ifindex;
-
-	/* add CAN specific message flags for raw_recvmsg() */
-	pflags = raw_flags(skb);
-	*pflags = 0;
+	
+	j1939flags = j1939_flags(skb);
+	*j1939flags = 0;
 	if (oskb->sk)
-		*pflags |= MSG_DONTROUTE;
+		*j1939flags |= MSG_DONTROUTE;
 	if (oskb->sk == sk)
-		*pflags |= MSG_CONFIRM;
+		*j1939flags |= MSG_CONFIRM;
 
 	if (sock_queue_rcv_skb(sk, skb) < 0)
 		kfree_skb(skb);
+
 }
 
-static int raw_enable_filters(struct net_device *dev, struct sock *sk,
+//Enable CAN Filters passed and configured by userland
+//using setsockopt
+
+static int j1939_enable_filters(struct net_device *dev, struct sock *sk,
 			      struct can_filter *filter, int count)
 {
 	int err = 0;
@@ -150,13 +122,13 @@ static int raw_enable_filters(struct net_device *dev, struct sock *sk,
 	for (i = 0; i < count; i++) {
 		err = can_rx_register(dev, filter[i].can_id,
 				      filter[i].can_mask,
-				      raw_rcv, sk, "raw", sk);
+				      j1939_rcv, sk, "j1939", sk);
 		if (err) {
 			/* clean up successfully registered filters */
 			while (--i >= 0)
 				can_rx_unregister(dev, filter[i].can_id,
 						  filter[i].can_mask,
-						  raw_rcv, sk);
+						  j1939_rcv, sk);
 			break;
 		}
 	}
@@ -164,67 +136,39 @@ static int raw_enable_filters(struct net_device *dev, struct sock *sk,
 	return err;
 }
 
-static int raw_enable_errfilter(struct net_device *dev, struct sock *sk,
-				can_err_mask_t err_mask)
-{
-	int err = 0;
-
-	if (err_mask)
-		err = can_rx_register(dev, 0, err_mask | CAN_ERR_FLAG,
-				      raw_rcv, sk, "raw", sk);
-
-	return err;
-}
-
-static void raw_disable_filters(struct net_device *dev, struct sock *sk,
+static void j1939_disable_filters(struct net_device *dev, struct sock *sk,
 			      struct can_filter *filter, int count)
 {
 	int i;
 
 	for (i = 0; i < count; i++)
 		can_rx_unregister(dev, filter[i].can_id, filter[i].can_mask,
-				  raw_rcv, sk);
+				  j1939_rcv, sk);
 }
 
-static inline void raw_disable_errfilter(struct net_device *dev,
-					 struct sock *sk,
-					 can_err_mask_t err_mask)
-
-{
-	if (err_mask)
-		can_rx_unregister(dev, 0, err_mask | CAN_ERR_FLAG,
-				  raw_rcv, sk);
-}
-
-static inline void raw_disable_allfilters(struct net_device *dev,
+static inline void j1939_disable_allfilters(struct net_device *dev,
 					  struct sock *sk)
 {
-	struct raw_sock *ro = raw_sk(sk);
+	struct j1939_sock *ro = j1939_sk(sk);
 
-	raw_disable_filters(dev, sk, ro->filter, ro->count);
-	raw_disable_errfilter(dev, sk, ro->err_mask);
+	j1939_disable_filters(dev, sk, ro->filter, ro->count);
 }
 
-static int raw_enable_allfilters(struct net_device *dev, struct sock *sk)
+static int j1939_enable_allfilters(struct net_device *dev, struct sock *sk)
 {
-	struct raw_sock *ro = raw_sk(sk);
+	struct j1939_sock *ro = j1939_sk(sk);
 	int err;
 
-	err = raw_enable_filters(dev, sk, ro->filter, ro->count);
-	if (!err) {
-		err = raw_enable_errfilter(dev, sk, ro->err_mask);
-		if (err)
-			raw_disable_filters(dev, sk, ro->filter, ro->count);
-	}
+	err = j1939_enable_filters(dev, sk, ro->filter, ro->count);
 
 	return err;
 }
 
-static int raw_notifier(struct notifier_block *nb,
+static int j1939_notifier(struct notifier_block *nb,
 			unsigned long msg, void *ptr)
 {
 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
-	struct raw_sock *ro = container_of(nb, struct raw_sock, notifier);
+	struct j1939_sock *ro = container_of(nb, struct j1939_sock, notifier);
 	struct sock *sk = &ro->sk;
 
 	if (!net_eq(dev_net(dev), &init_net))
@@ -242,7 +186,7 @@ static int raw_notifier(struct notifier_block *nb,
 		lock_sock(sk);
 		/* remove current filters & unregister */
 		if (ro->bound)
-			raw_disable_allfilters(dev, sk);
+			j1939_disable_allfilters(dev, sk);
 
 		if (ro->count > 1)
 			kfree(ro->filter);
@@ -267,47 +211,36 @@ static int raw_notifier(struct notifier_block *nb,
 	return NOTIFY_DONE;
 }
 
-static int raw_init(struct sock *sk)
+static int j1939_init(struct sock *sk)
 {
-	struct raw_sock *ro = raw_sk(sk);
+	struct j1939_sock *ro = j1939_sk(sk);
 
 	ro->bound            = 0;
 	ro->ifindex          = 0;
 
 	/* set default filter to single entry dfilter */
 	ro->dfilter.can_id   = 0;
-	ro->dfilter.can_mask = MASK_ALL;
+	ro->dfilter.can_mask = 0;
 	ro->filter           = &ro->dfilter;
 	ro->count            = 1;
 
-	/* set default loopback behaviour */
-	ro->loopback         = 1;
-	ro->recv_own_msgs    = 0;
-	ro->fd_frames        = 0;
-	ro->join_filters     = 0;
-
-	/* alloc_percpu provides zero'ed memory */
-	ro->uniq = alloc_percpu(struct uniqframe);
-	if (unlikely(!ro->uniq))
-		return -ENOMEM;
-
 	/* set notifier */
-	ro->notifier.notifier_call = raw_notifier;
+	ro->notifier.notifier_call = j1939_notifier;
 
 	register_netdevice_notifier(&ro->notifier);
 
 	return 0;
 }
 
-static int raw_release(struct socket *sock)
+static int j1939_release(struct socket *sock)
 {
 	struct sock *sk = sock->sk;
-	struct raw_sock *ro;
+	struct j1939_sock *ro;
 
 	if (!sk)
 		return 0;
 
-	ro = raw_sk(sk);
+	ro = j1939_sk(sk);
 
 	unregister_netdevice_notifier(&ro->notifier);
 
@@ -320,20 +253,19 @@ static int raw_release(struct socket *sock)
 
 			dev = dev_get_by_index(&init_net, ro->ifindex);
 			if (dev) {
-				raw_disable_allfilters(dev, sk);
+				j1939_disable_allfilters(dev, sk);
 				dev_put(dev);
 			}
 		} else
-			raw_disable_allfilters(NULL, sk);
+			j1939_disable_allfilters(NULL, sk);
 	}
 
-	if (ro->count > 1)
+	if (ro->count >= 1)
 		kfree(ro->filter);
 
 	ro->ifindex = 0;
 	ro->bound   = 0;
 	ro->count   = 0;
-	free_percpu(ro->uniq);
 
 	sock_orphan(sk);
 	sock->sk = NULL;
@@ -344,11 +276,11 @@ static int raw_release(struct socket *sock)
 	return 0;
 }
 
-static int raw_bind(struct socket *sock, struct sockaddr *uaddr, int len)
+static int j1939_bind(struct socket *sock, struct sockaddr *uaddr, int len)
 {
 	struct sockaddr_can *addr = (struct sockaddr_can *)uaddr;
 	struct sock *sk = sock->sk;
-	struct raw_sock *ro = raw_sk(sk);
+	struct j1939_sock *ro = j1939_sk(sk);
 	int ifindex;
 	int err = 0;
 	int notify_enetdown = 0;
@@ -380,13 +312,13 @@ static int raw_bind(struct socket *sock, struct sockaddr *uaddr, int len)
 		ifindex = dev->ifindex;
 
 		/* filters set by default/setsockopt */
-		err = raw_enable_allfilters(dev, sk);
+		err = j1939_enable_allfilters(dev, sk);
 		dev_put(dev);
 	} else {
 		ifindex = 0;
 
 		/* filters set by default/setsockopt */
-		err = raw_enable_allfilters(NULL, sk);
+		err = j1939_enable_allfilters(NULL, sk);
 	}
 
 	if (!err) {
@@ -397,11 +329,11 @@ static int raw_bind(struct socket *sock, struct sockaddr *uaddr, int len)
 
 				dev = dev_get_by_index(&init_net, ro->ifindex);
 				if (dev) {
-					raw_disable_allfilters(dev, sk);
+					j1939_disable_allfilters(dev, sk);
 					dev_put(dev);
 				}
 			} else
-				raw_disable_allfilters(NULL, sk);
+				j1939_disable_allfilters(NULL, sk);
 		}
 		ro->ifindex = ifindex;
 		ro->bound = 1;
@@ -419,12 +351,12 @@ static int raw_bind(struct socket *sock, struct sockaddr *uaddr, int len)
 	return err;
 }
 
-static int raw_getname(struct socket *sock, struct sockaddr *uaddr,
+static int j1939_getname(struct socket *sock, struct sockaddr *uaddr,
 		       int *len, int peer)
 {
 	struct sockaddr_can *addr = (struct sockaddr_can *)uaddr;
 	struct sock *sk = sock->sk;
-	struct raw_sock *ro = raw_sk(sk);
+	struct j1939_sock *ro = j1939_sk(sk);
 
 	if (peer)
 		return -EOPNOTSUPP;
@@ -438,28 +370,27 @@ static int raw_getname(struct socket *sock, struct sockaddr *uaddr,
 	return 0;
 }
 
-static int raw_setsockopt(struct socket *sock, int level, int optname,
+static int j1939_setsockopt(struct socket *sock, int level, int optname,
 			  char __user *optval, unsigned int optlen)
 {
 	struct sock *sk = sock->sk;
-	struct raw_sock *ro = raw_sk(sk);
+	struct j1939_sock *ro = j1939_sk(sk);
 	struct can_filter *filter = NULL;  /* dyn. alloc'ed filters */
 	struct can_filter sfilter;         /* single filter */
 	struct net_device *dev = NULL;
-	can_err_mask_t err_mask = 0;
 	int count = 0;
 	int err = 0;
-
-	if (level != SOL_CAN_RAW)
+	
+	if (level != SOL_CAN_J1939)
 		return -EINVAL;
 
 	switch (optname) {
 
-	case CAN_RAW_FILTER:
+	case CAN_J1939_FILTER:
 		if (optlen % sizeof(struct can_filter) != 0)
 			return -EINVAL;
 
-		if (optlen > CAN_RAW_FILTER_MAX * sizeof(struct can_filter))
+		if (optlen > CAN_J1939_FILTER_MAX * sizeof(struct can_filter))
 			return -EINVAL;
 
 		count = optlen / sizeof(struct can_filter);
@@ -482,9 +413,9 @@ static int raw_setsockopt(struct socket *sock, int level, int optname,
 		if (ro->bound) {
 			/* (try to) register the new filters */
 			if (count == 1)
-				err = raw_enable_filters(dev, sk, &sfilter, 1);
+				err = j1939_enable_filters(dev, sk, &sfilter, 1);
 			else
-				err = raw_enable_filters(dev, sk, filter,
+				err = j1939_enable_filters(dev, sk, filter,
 							 count);
 			if (err) {
 				if (count > 1)
@@ -493,7 +424,7 @@ static int raw_setsockopt(struct socket *sock, int level, int optname,
 			}
 
 			/* remove old filter registrations */
-			raw_disable_filters(dev, sk, ro->filter, ro->count);
+			j1939_disable_filters(dev, sk, ro->filter, ro->count);
 		}
 
 		/* remove old filter space */
@@ -517,104 +448,33 @@ static int raw_setsockopt(struct socket *sock, int level, int optname,
 
 		break;
 
-	case CAN_RAW_ERR_FILTER:
-		if (optlen != sizeof(err_mask))
-			return -EINVAL;
-
-		if (copy_from_user(&err_mask, optval, optlen))
-			return -EFAULT;
-
-		err_mask &= CAN_ERR_MASK;
-
-		lock_sock(sk);
-
-		if (ro->bound && ro->ifindex)
-			dev = dev_get_by_index(&init_net, ro->ifindex);
-
-		/* remove current error mask */
-		if (ro->bound) {
-			/* (try to) register the new err_mask */
-			err = raw_enable_errfilter(dev, sk, err_mask);
-
-			if (err)
-				goto out_err;
-
-			/* remove old err_mask registration */
-			raw_disable_errfilter(dev, sk, ro->err_mask);
-		}
-
-		/* link new err_mask to the socket */
-		ro->err_mask = err_mask;
-
- out_err:
-		if (dev)
-			dev_put(dev);
-
-		release_sock(sk);
-
-		break;
-
-	case CAN_RAW_LOOPBACK:
-		if (optlen != sizeof(ro->loopback))
-			return -EINVAL;
-
-		if (copy_from_user(&ro->loopback, optval, optlen))
-			return -EFAULT;
-
-		break;
-
-	case CAN_RAW_RECV_OWN_MSGS:
-		if (optlen != sizeof(ro->recv_own_msgs))
-			return -EINVAL;
-
-		if (copy_from_user(&ro->recv_own_msgs, optval, optlen))
-			return -EFAULT;
-
-		break;
-
-	case CAN_RAW_FD_FRAMES:
-		if (optlen != sizeof(ro->fd_frames))
-			return -EINVAL;
-
-		if (copy_from_user(&ro->fd_frames, optval, optlen))
-			return -EFAULT;
-
-		break;
-
-	case CAN_RAW_JOIN_FILTERS:
-		if (optlen != sizeof(ro->join_filters))
-			return -EINVAL;
-
-		if (copy_from_user(&ro->join_filters, optval, optlen))
-			return -EFAULT;
-
-		break;
-
 	default:
 		return -ENOPROTOOPT;
 	}
 	return err;
 }
 
-static int raw_getsockopt(struct socket *sock, int level, int optname,
+static int j1939_getsockopt(struct socket *sock, int level, int optname,
 			  char __user *optval, int __user *optlen)
 {
 	struct sock *sk = sock->sk;
-	struct raw_sock *ro = raw_sk(sk);
+	struct j1939_sock *ro = j1939_sk(sk);
 	int len;
 	void *val;
 	int err = 0;
 
-	if (level != SOL_CAN_RAW)
+	if (level != SOL_CAN_J1939)
 		return -EINVAL;
+
 	if (get_user(len, optlen))
 		return -EFAULT;
+
 	if (len < 0)
 		return -EINVAL;
 
 	switch (optname) {
 
-	case CAN_RAW_FILTER:
+	case CAN_J1939_FILTER:
 		lock_sock(sk);
 		if (ro->count > 0) {
 			int fsize = ro->count * sizeof(struct can_filter);
@@ -630,36 +490,6 @@ static int raw_getsockopt(struct socket *sock, int level, int optname,
 			err = put_user(len, optlen);
 		return err;
 
-	case CAN_RAW_ERR_FILTER:
-		if (len > sizeof(can_err_mask_t))
-			len = sizeof(can_err_mask_t);
-		val = &ro->err_mask;
-		break;
-
-	case CAN_RAW_LOOPBACK:
-		if (len > sizeof(int))
-			len = sizeof(int);
-		val = &ro->loopback;
-		break;
-
-	case CAN_RAW_RECV_OWN_MSGS:
-		if (len > sizeof(int))
-			len = sizeof(int);
-		val = &ro->recv_own_msgs;
-		break;
-
-	case CAN_RAW_FD_FRAMES:
-		if (len > sizeof(int))
-			len = sizeof(int);
-		val = &ro->fd_frames;
-		break;
-
-	case CAN_RAW_JOIN_FILTERS:
-		if (len > sizeof(int))
-			len = sizeof(int);
-		val = &ro->join_filters;
-		break;
-
 	default:
 		return -ENOPROTOOPT;
 	}
@@ -671,37 +501,21 @@ static int raw_getsockopt(struct socket *sock, int level, int optname,
 	return 0;
 }
 
-static int raw_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
+static int j1939_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 {
 	struct sock *sk = sock->sk;
-	struct raw_sock *ro = raw_sk(sk);
+	struct j1939_sock *ro = j1939_sk(sk);
 	struct sk_buff *skb;
 	struct net_device *dev;
-	int ifindex;
 	int err;
+	
+	if (!ro->bound) //Socket not yet bound
+		return -EADDRNOTAVAIL;
 
-	if (msg->msg_name) {
-		DECLARE_SOCKADDR(struct sockaddr_can *, addr, msg->msg_name);
+	if (size != CAN_MTU)
+		return -EINVAL;
 
-		if (msg->msg_namelen < sizeof(*addr))
-			return -EINVAL;
-
-		if (addr->can_family != AF_CAN)
-			return -EINVAL;
-
-		ifindex = addr->can_ifindex;
-	} else
-		ifindex = ro->ifindex;
-
-	if (ro->fd_frames) {
-		if (unlikely(size != CANFD_MTU && size != CAN_MTU))
-			return -EINVAL;
-	} else {
-		if (unlikely(size != CAN_MTU))
-			return -EINVAL;
-	}
-
-	dev = dev_get_by_index(&init_net, ifindex);
+	dev = dev_get_by_index(sock_net(sk), ro->ifindex);
 	if (!dev)
 		return -ENXIO;
 
@@ -722,9 +536,8 @@ static int raw_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 
 	skb->dev = dev;
 	skb->sk  = sk;
-	skb->priority = sk->sk_priority;
 
-	err = can_send(skb, ro->loopback);
+	err = can_send(skb, 1);
 
 	dev_put(dev);
 
@@ -741,7 +554,7 @@ send_failed:
 	return err;
 }
 
-static int raw_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
+static int j1939_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
 		       int flags)
 {
 	struct sock *sk = sock->sk;
@@ -774,31 +587,30 @@ static int raw_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
 		msg->msg_namelen = sizeof(struct sockaddr_can);
 		memcpy(msg->msg_name, skb->cb, msg->msg_namelen);
 	}
-
-	/* assign the flags that have been recorded in raw_rcv() */
-	msg->msg_flags |= *(raw_flags(skb));
+	
+	msg->msg_flags |= *(j1939_flags(skb));
 
 	skb_free_datagram(sk, skb);
-
+	
 	return size;
 }
 
 static const struct proto_ops j1939_ops = {
 	.family        = PF_CAN,
-	.release       = raw_release,
-	.bind          = raw_bind,
+	.release       = j1939_release,
+	.bind          = j1939_bind,
 	.connect       = sock_no_connect,
 	.socketpair    = sock_no_socketpair,
 	.accept        = sock_no_accept,
-	.getname       = raw_getname,
-	.poll          = datagram_poll,
+	.getname       = j1939_getname,
+	.poll          = sock_no_poll,
 	.ioctl         = can_ioctl,	/* use can_ioctl() from af_can.c */
 	.listen        = sock_no_listen,
 	.shutdown      = sock_no_shutdown,
-	.setsockopt    = raw_setsockopt,
-	.getsockopt    = raw_getsockopt,
-	.sendmsg       = raw_sendmsg,
-	.recvmsg       = raw_recvmsg,
+	.setsockopt    = j1939_setsockopt,
+	.getsockopt    = j1939_getsockopt,
+	.sendmsg       = j1939_sendmsg,
+	.recvmsg       = j1939_recvmsg,
 	.mmap          = sock_no_mmap,
 	.sendpage      = sock_no_sendpage,
 };
@@ -806,8 +618,8 @@ static const struct proto_ops j1939_ops = {
 static struct proto j1939_proto __read_mostly = {
 	.name       = "CAN_J1939",
 	.owner      = THIS_MODULE,
-	.obj_size   = sizeof(struct raw_sock),
-	.init       = raw_init,
+	.obj_size   = sizeof(struct j1939_sock),
+	.init       = j1939_init,
 };
 
 static const struct can_proto j1939_can_proto = {

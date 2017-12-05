@@ -40,7 +40,7 @@
  
  enum {
 	CAN_J1939_FILTER = 1,	/* set 0 .. n can_filter(s)          */
-    CAN_J1939_MAX_IOCTLS
+	CAN_J1939_MAX_IOCTLS
 };
  
  /*
@@ -55,8 +55,6 @@ MODULE_AUTHOR("imed benromdhane <benromdhane.imed@gmail.com>");
 MODULE_ALIAS("can-proto-5");
 
 
-
-
 struct j1939_sock {
 	struct sock sk;
 	int bound;
@@ -67,15 +65,6 @@ struct j1939_sock {
 	struct can_filter *filter; /* pointer to filter(s) */
 };
 
-static inline unsigned int *j1939_flags(struct sk_buff *skb)
-{
-	sock_skb_cb_check_size(sizeof(struct sockaddr_can) +
-			       sizeof(unsigned int));
-
-	/* return pointer after struct sockaddr_can */
-	return (unsigned int *)(&((struct sockaddr_can *)skb->cb)[1]);
-}
-
 static inline struct j1939_sock *j1939_sk(const struct sock *sk)
 {
 	return (struct j1939_sock *)sk;
@@ -85,25 +74,19 @@ static void j1939_rcv(struct sk_buff *oskb, void * data)
 {
 	struct sock *sk = (struct sock *)data;
 	struct sockaddr_can *addr;
-	unsigned int * j1939flags;
 	struct sk_buff *skb; 
-	/* clone the given skb to be able to enqueue it into the rcv queue */
+
 	skb = skb_clone(oskb, GFP_ATOMIC);
 	if (!skb)
 		return;
 
-	sock_skb_cb_check_size(sizeof(struct sockaddr_can));
+	skb->tstamp = oskb->tstamp;
+	skb->dev = oskb->dev;
+	BUILD_BUG_ON(sizeof(skb->cb) < sizeof(struct sockaddr_can));
 	addr = (struct sockaddr_can *)skb->cb;
 	memset(addr, 0, sizeof(*addr));
 	addr->can_family  = AF_CAN;
 	addr->can_ifindex = skb->dev->ifindex;
-	
-	j1939flags = j1939_flags(skb);
-	*j1939flags = 0;
-	if (oskb->sk)
-		*j1939flags |= MSG_DONTROUTE;
-	if (oskb->sk == sk)
-		*j1939flags |= MSG_CONFIRM;
 
 	if (sock_queue_rcv_skb(sk, skb) < 0)
 		kfree_skb(skb);
@@ -415,8 +398,7 @@ static int j1939_setsockopt(struct socket *sock, int level, int optname,
 			if (count == 1)
 				err = j1939_enable_filters(dev, sk, &sfilter, 1);
 			else
-				err = j1939_enable_filters(dev, sk, filter,
-							 count);
+				err = j1939_enable_filters(dev, sk, filter, count);
 			if (err) {
 				if (count > 1)
 					kfree(filter);
@@ -512,19 +494,18 @@ static int j1939_sendmsg(struct socket *sock, struct msghdr *msg, size_t size)
 	if (!ro->bound) //Socket not yet bound
 		return -EADDRNOTAVAIL;
 
-	if (size != CAN_MTU)
+	if (size != CAN_MTU) //Wrong size passed
 		return -EINVAL;
 
 	dev = dev_get_by_index(sock_net(sk), ro->ifindex);
 	if (!dev)
 		return -ENXIO;
 
-	skb = sock_alloc_send_skb(sk, size + sizeof(struct can_skb_priv),
+	skb = sock_alloc_send_skb(sk, size,
 				  msg->msg_flags & MSG_DONTWAIT, &err);
 	if (!skb)
 		goto put_dev;
 
-	can_skb_reserve(skb);
 	can_skb_prv(skb)->ifindex = dev->ifindex;
 	can_skb_prv(skb)->skbcnt = 0;
 
@@ -555,7 +536,7 @@ send_failed:
 }
 
 static int j1939_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
-		       int flags)
+		                 int flags)
 {
 	struct sock *sk = sock->sk;
 	struct sk_buff *skb;
@@ -580,15 +561,13 @@ static int j1939_recvmsg(struct socket *sock, struct msghdr *msg, size_t size,
 		return err;
 	}
 
-	sock_recv_ts_and_drops(msg, sk, skb);
+	sock_recv_timestamp(msg, sk, skb);
 
 	if (msg->msg_name) {
 		__sockaddr_check_size(sizeof(struct sockaddr_can));
 		msg->msg_namelen = sizeof(struct sockaddr_can);
 		memcpy(msg->msg_name, skb->cb, msg->msg_namelen);
 	}
-	
-	msg->msg_flags |= *(j1939_flags(skb));
 
 	skb_free_datagram(sk, skb);
 	

@@ -202,8 +202,8 @@ static int j1939_init(struct sock *sk)
 	ro->ifindex          = 0;
 
 	/* set default filter to single entry dfilter */
-	ro->dfilter.can_id   = 0;
-	ro->dfilter.can_mask = 0;
+	ro->dfilter.can_id   = 0x80000000; //Accepts only CAN Extended IDs
+	ro->dfilter.can_mask = 0x80000000; //Accepts only CAN Extended IDs
 	ro->filter           = &ro->dfilter;
 	ro->count            = 1;
 

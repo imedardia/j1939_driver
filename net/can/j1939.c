@@ -23,6 +23,7 @@
 #include <linux/can/raw.h>
 #include <net/sock.h>
 #include <net/net_namespace.h>
+#include <linux/version.h>
 
 #define CAN_J1939_VERSION "20171203"
 /*
@@ -103,15 +104,27 @@ static int j1939_enable_filters(struct net_device *dev, struct sock *sk,
 	int i;
 
 	for (i = 0; i < count; i++) {
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,10,17)
 		err = can_rx_register(dev, filter[i].can_id,
 				      filter[i].can_mask,
 				      j1939_rcv, sk, "j1939", sk);
+#else
+		err = can_rx_register(&init_net, dev, filter[i].can_id,
+				      filter[i].can_mask,
+				      j1939_rcv, sk, "j1939", sk);
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(4,10,17) */
 		if (err) {
 			/* clean up successfully registered filters */
 			while (--i >= 0)
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,10,17)
 				can_rx_unregister(dev, filter[i].can_id,
 						  filter[i].can_mask,
 						  j1939_rcv, sk);
+#else
+				can_rx_unregister(&init_net, dev, filter[i].can_id,
+						  filter[i].can_mask,
+						  j1939_rcv, sk);
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(4,10,17) */
 			break;
 		}
 	}
@@ -125,8 +138,15 @@ static void j1939_disable_filters(struct net_device *dev, struct sock *sk,
 	int i;
 
 	for (i = 0; i < count; i++)
-		can_rx_unregister(dev, filter[i].can_id, filter[i].can_mask,
-				  j1939_rcv, sk);
+#if LINUX_VERSION_CODE <= KERNEL_VERSION(4,10,17)
+				can_rx_unregister(dev, filter[i].can_id,
+						  filter[i].can_mask,
+						  j1939_rcv, sk);
+#else
+				can_rx_unregister(&init_net, dev, filter[i].can_id,
+						  filter[i].can_mask,
+						  j1939_rcv, sk);
+#endif /* LINUX_VERSION_CODE >= KERNEL_VERSION(4,10,17) */
 }
 
 static inline void j1939_disable_allfilters(struct net_device *dev,
